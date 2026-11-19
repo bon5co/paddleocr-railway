@@ -33,10 +33,13 @@ from PIL import Image, ImageOps
 Image.MAX_IMAGE_PIXELS = 120_000_000
 
 API_KEY = os.environ.get("API_KEY") or ""
-TIER = (os.environ.get("OCR_TIER") or "medium").strip().lower()
+TIER = (os.environ.get("OCR_TIER") or "small").strip().lower()
 TIERS = ("medium", "small", "tiny")
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB") or 25)
-MAX_PAGES = int(os.environ.get("MAX_PAGES") or 30)
+# Pages one request may read. Railway's edge drops a request at about 5 minutes, and a
+# dense A4 page measured 55 s (medium), 27 s (small) on an 8 vCPU Railway container, so the
+# default keeps a full request inside the limit. Larger PDFs: call again with first_page.
+MAX_PAGES = int(os.environ.get("MAX_PAGES") or {"medium": 4, "small": 8, "tiny": 20}.get(TIER, 8))
 PDF_SCALE = float(os.environ.get("PDF_SCALE") or 2.0)
 CPU_THREADS = int(os.environ.get("OCR_CPU_THREADS") or os.environ.get("OMP_NUM_THREADS") or 4)
 AUTO_ROTATE_DEFAULT = (os.environ.get("OCR_AUTO_ROTATE") or "true").lower() in ("1", "true", "yes")
@@ -103,7 +106,7 @@ def health():
     return {"status": "ok", "model": f"PP-OCRv6_{TIER}", "threads": CPU_THREADS, "loaded_in_s": _state["loaded_in"]}
 
 
-def _pages_from_upload(data: bytes, max_pages: int):
+def _pages_from_upload(data: bytes, first_page: int, max_pages: int):
     """Yield (page_number, BGR ndarray) for an image or PDF."""
     if data[:5] == b"%PDF-":
         import pypdfium2 as pdfium
@@ -113,7 +116,7 @@ def _pages_from_upload(data: bytes, max_pages: int):
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(422, f"could not open the PDF: {exc}") from exc
         total = len(pdf)
-        for index in range(min(total, max_pages)):
+        for index in range(first_page - 1, min(total, first_page - 1 + max_pages)):
             pil = pdf[index].render(scale=PDF_SCALE).to_pil().convert("RGB")
             yield index + 1, np.ascontiguousarray(np.asarray(pil)[:, :, ::-1]), total
         return
@@ -150,7 +153,8 @@ def ocr_endpoint(
     file: UploadFile = File(..., description="PNG, JPEG, WebP, BMP, TIFF or PDF"),
     min_confidence: float = Query(0.0, ge=0.0, le=1.0, description="drop lines scoring below this"),
     rotate: bool = Query(AUTO_ROTATE_DEFAULT, description="fix 90/180/270 degree page rotation first"),
-    max_pages: int = Query(MAX_PAGES, ge=1, le=MAX_PAGES, description="PDF pages to read, from the first"),
+    first_page: int = Query(1, ge=1, description="PDF page to start at (1-based); page through long PDFs"),
+    max_pages: int = Query(MAX_PAGES, ge=1, le=MAX_PAGES, description="PDF pages to read from first_page"),
 ):
     if _state["ocr"] is None:
         raise HTTPException(503, _state["error"] or "model is still loading, retry in a few seconds")
@@ -162,7 +166,7 @@ def ocr_endpoint(
 
     t0 = time.time()
     pages, total = [], 1
-    for number, array, total in _pages_from_upload(data, max_pages):
+    for number, array, total in _pages_from_upload(data, first_page, max_pages):
         with _lock:
             results = _state["ocr"].predict(array, use_doc_orientation_classify=rotate)
         lines = _lines(results[0], min_confidence) if results else []
@@ -178,6 +182,7 @@ def ocr_endpoint(
     return {
         "model": f"PP-OCRv6_{TIER}",
         "page_count": total,
+        "next_page": (pages[-1]["page"] + 1) if pages and pages[-1]["page"] < total else None,
         "pages_read": len(pages),
         "text": "\n\n".join(page["text"] for page in pages),
         "pages": pages,
